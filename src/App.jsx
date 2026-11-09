@@ -2,18 +2,16 @@
 import { useEffect, useState } from 'react'
 import QRCode from 'qrcode'
 import { Html5Qrcode } from 'html5-qrcode'
-
-const STORAGE_KEY = 'attic-organizer-boxes'
+import { supabase } from './supabase'
 
 function App() {
-  const [boxes, setBoxes] = useState(() => {
-    try {
-      return JSON.parse(localStorage.getItem(STORAGE_KEY)) || []
-    } catch {
-      return []
-    }
-  })
-
+  const [session, setSession] = useState(null)
+  const [authLoading, setAuthLoading] = useState(true)
+  const [loading, setLoading] = useState(false)
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [error, setError] = useState('')
+  const [boxes, setBoxes] = useState([])
   const [boxName, setBoxName] = useState('')
   const [itemName, setItemName] = useState('')
   const [selectedBox, setSelectedBox] = useState(null)
@@ -22,8 +20,92 @@ function App() {
   const [scanning, setScanning] = useState(false)
 
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(boxes))
-  }, [boxes])
+    supabase.auth.getSession().then(({ data, error }) => {
+      if (error) setError(error.message)
+      setSession(data?.session ?? null)
+      setAuthLoading(false)
+    })
+
+    const { data: listener } = supabase.auth.onAuthStateChange(
+      (_event, session) => {
+        setSession(session)
+        setError('')
+      }
+    )
+
+    return () => listener.subscription.unsubscribe()
+  }, [])
+
+  useEffect(() => {
+    if (!session) {
+      setBoxes([])
+      setSelectedBox(null)
+      return
+    }
+
+    let active = true
+
+    async function loadBoxes() {
+      setLoading(true)
+      setError('')
+
+      const { data, error } = await supabase
+        .from('boxes')
+        .select('id, name, items')
+        .order('created_at', { ascending: true })
+
+      if (!active) return
+
+      if (error) {
+        setError(error.message)
+        setLoading(false)
+        return
+      }
+
+      let cloudBoxes = (data || []).map(box => ({
+        ...box,
+        items: Array.isArray(box.items) ? box.items : []
+      }))
+
+      if (cloudBoxes.length === 0) {
+        try {
+          const oldBoxes = JSON.parse(
+            localStorage.getItem('attic-organizer-boxes') || '[]'
+          )
+
+          if (oldBoxes.length > 0) {
+            const { data: migrated, error: migrationError } =
+              await supabase
+                .from('boxes')
+                .insert(oldBoxes.map(box => ({
+                  id: box.id,
+                  name: box.name,
+                  items: box.items || []
+                })))
+                .select('id, name, items')
+
+            if (migrationError) throw migrationError
+
+            cloudBoxes = migrated || []
+            localStorage.removeItem('attic-organizer-boxes')
+          }
+        } catch (err) {
+          setError('Could not transfer old boxes: ' + err.message)
+        }
+      }
+
+      if (active) {
+        setBoxes(cloudBoxes)
+        setLoading(false)
+      }
+    }
+
+    loadBoxes()
+
+    return () => {
+      active = false
+    }
+  }, [session])
 
   useEffect(() => {
     const box = boxes.find(b => b.id === selectedBox)
@@ -47,7 +129,7 @@ function App() {
     scanner.start(
       { facingMode: 'environment' },
       { fps: 10, qrbox: { width: 220, height: 220 } },
-      (decodedText) => {
+      decodedText => {
         if (!active) return
 
         const id = decodedText.replace('ATTIC-BOX:', '')
@@ -72,9 +154,29 @@ function App() {
     }
   }, [scanning, boxes])
 
-  function addBox(e) {
+  async function signIn(e) {
+    e.preventDefault()
+    setError('')
+
+    const { error } = await supabase.auth.signInWithPassword({
+      email,
+      password
+    })
+
+    if (error) setError(error.message)
+  }
+
+  async function signOut() {
+    setScanning(false)
+    const { error } = await supabase.auth.signOut()
+    if (error) setError(error.message)
+  }
+
+  async function addBox(e) {
     e.preventDefault()
     if (!boxName.trim()) return
+
+    setError('')
 
     const newBox = {
       id: crypto.randomUUID(),
@@ -82,40 +184,80 @@ function App() {
       items: []
     }
 
+    const { error } = await supabase.from('boxes').insert(newBox)
+
+    if (error) {
+      setError(error.message)
+      return
+    }
+
     setBoxes(previous => [...previous, newBox])
     setBoxName('')
     setSelectedBox(newBox.id)
   }
 
-  function addItem(e) {
+  async function addItem(e) {
     e.preventDefault()
     if (!itemName.trim() || !selectedBox) return
 
-    setBoxes(previous =>
-      previous.map(box =>
-        box.id === selectedBox
-          ? { ...box, items: [...box.items, itemName.trim()] }
-          : box
-      )
-    )
+    const box = boxes.find(b => b.id === selectedBox)
+    if (!box) return
+
+    const updatedItems = [...box.items, itemName.trim()]
+
+    const { error } = await supabase
+      .from('boxes')
+      .update({ items: updatedItems })
+      .eq('id', selectedBox)
+
+    if (error) {
+      setError(error.message)
+      return
+    }
+
+    setBoxes(previous => previous.map(b =>
+      b.id === selectedBox ? { ...b, items: updatedItems } : b
+    ))
 
     setItemName('')
   }
 
-  function deleteBox(id) {
+  async function deleteBox(id) {
     if (!confirm('Delete this box and all its items?')) return
+
+    const { error } = await supabase
+      .from('boxes')
+      .delete()
+      .eq('id', id)
+
+    if (error) {
+      setError(error.message)
+      return
+    }
+
     setBoxes(previous => previous.filter(box => box.id !== id))
     if (selectedBox === id) setSelectedBox(null)
   }
 
-  function deleteItem(index) {
-    setBoxes(previous =>
-      previous.map(box =>
-        box.id === selectedBox
-          ? { ...box, items: box.items.filter((_, i) => i !== index) }
-          : box
-      )
-    )
+  async function deleteItem(index) {
+    const box = boxes.find(b => b.id === selectedBox)
+    if (!box) return
+
+    const updatedItems = box.items.filter((_, i) => i !== index)
+
+    const { error } = await supabase
+      .from('boxes')
+      .update({ items: updatedItems })
+      .eq('id', selectedBox)
+
+    if (error) {
+      setError(error.message)
+      return
+    }
+
+    setBoxes(previous => previous.map(b =>
+      b.id === selectedBox ? { ...b, items: updatedItems } : b
+    ))
   }
 
   const selected = boxes.find(box => box.id === selectedBox)
@@ -126,6 +268,53 @@ function App() {
       item.toLowerCase().includes(search.toLowerCase())
     )
   )
+
+  if (authLoading) {
+    return <div className="app"><h2>Loading Attic Organizer...</h2></div>
+  }
+
+  if (!session) {
+    return (
+      <div className="app">
+        <style>{`
+          * { box-sizing: border-box; }
+          body { margin: 0; background: #f4f5f7; font-family: Arial, sans-serif; color: #20242b; }
+          .app { max-width: 950px; margin: auto; padding: 24px 16px; }
+          .panel { background: white; padding: 20px; border-radius: 13px; margin: 20px 0; }
+          input { width: 100%; padding: 12px; border: 1px solid #d6d9df; border-radius: 8px; font-size: 15px; margin-bottom: 10px; }
+          button { border: 0; border-radius: 8px; padding: 12px 15px; background: #20242b; color: white; cursor: pointer; }
+          .error { color: #b42318; }
+        `}</style>
+
+        <section className="panel">
+          <h1>📦 Attic Organizer</h1>
+          <p>Sign in to access your household inventory.</p>
+
+          <form onSubmit={signIn}>
+            <input
+              type="email"
+              value={email}
+              onChange={e => setEmail(e.target.value)}
+              placeholder="Email address"
+              required
+            />
+
+            <input
+              type="password"
+              value={password}
+              onChange={e => setPassword(e.target.value)}
+              placeholder="Password"
+              required
+            />
+
+            <button type="submit">Sign In</button>
+          </form>
+
+          {error && <p className="error">{error}</p>}
+        </section>
+      </div>
+    )
+  }
 
   return (
     <div className="app">
@@ -154,6 +343,7 @@ function App() {
         .item { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #eee; padding: 11px 0; gap: 10px; }
         .empty { color: #777; text-align: center; padding: 20px; }
         .reader { margin-top: 15px; }
+        .error { color: #b42318; }
         @media(max-width: 550px) {
           .detail { grid-template-columns: 1fr; }
           .qr { width: 150px; }
@@ -164,113 +354,137 @@ function App() {
       <header>
         <h1>📦 Attic Organizer</h1>
         <p>Know exactly what's inside every box.</p>
+        <p style={{ marginTop: 12 }}>
+          Signed in as {session.user.email}
+        </p>
+        <button className="secondary" onClick={signOut}>
+          Sign Out
+        </button>
       </header>
 
-      <section className="panel">
-        <h2>Add a storage box</h2>
-        <form onSubmit={addBox} className="form-row">
-          <input
-            value={boxName}
-            onChange={e => setBoxName(e.target.value)}
-            placeholder="Example: Box 1 - Holiday Decorations"
-          />
-          <button type="submit">+ Add Box</button>
-        </form>
-      </section>
+      {error && <section className="panel error">{error}</section>}
 
-      <section className="panel">
-        <h2>Find something</h2>
-        <input
-          value={search}
-          onChange={e => setSearch(e.target.value)}
-          placeholder="Search boxes or items..."
-        />
-        <button onClick={() => setScanning(!scanning)}>
-          {scanning ? 'Cancel Scan' : '📷 Scan a QR Code'}
-        </button>
+      {loading ? (
+        <section className="panel">Loading your household boxes...</section>
+      ) : (
+        <>
+          <section className="panel">
+            <h2>Add a storage box</h2>
+            <form onSubmit={addBox} className="form-row">
+              <input
+                value={boxName}
+                onChange={e => setBoxName(e.target.value)}
+                placeholder="Example: Box 1 - Holiday Decorations"
+              />
+              <button type="submit">+ Add Box</button>
+            </form>
+          </section>
 
-        {scanning && <div id="reader" className="reader" />}
-      </section>
+          <section className="panel">
+            <h2>Find something</h2>
+            <input
+              value={search}
+              onChange={e => setSearch(e.target.value)}
+              placeholder="Search boxes or items..."
+            />
+            <button onClick={() => setScanning(!scanning)}>
+              {scanning ? 'Cancel Scan' : '📷 Scan a QR Code'}
+            </button>
 
-      <section className="panel">
-        <h2>Your storage boxes ({filteredBoxes.length})</h2>
+            {scanning && <div id="reader" className="reader" />}
+          </section>
 
-        {filteredBoxes.length === 0 ? (
-          <div className="empty">No boxes found. Add your first box above.</div>
-        ) : (
-          <div className="box-list">
-            {filteredBoxes.map(box => (
-              <button
-                key={box.id}
-                className={`box-card ${selectedBox === box.id ? 'active' : ''}`}
-                onClick={() => setSelectedBox(box.id)}
-              >
-                <strong>📦 {box.name}</strong>
-                <span className="muted">{box.items.length} items</span>
-              </button>
-            ))}
-          </div>
-        )}
-      </section>
+          <section className="panel">
+            <h2>Your storage boxes ({filteredBoxes.length})</h2>
 
-      {selected && (
-        <section className="panel">
-          <div className="detail">
-            <div>
-              <h2>{selected.name}</h2>
-              <p className="muted">Contents of this box</p>
-
-              <form onSubmit={addItem} className="form-row">
-                <input
-                  value={itemName}
-                  onChange={e => setItemName(e.target.value)}
-                  placeholder="Add an item..."
-                />
-                <button type="submit">Add Item</button>
-              </form>
-
-              {selected.items.length === 0 ? (
-                <p className="empty">This box is empty.</p>
-              ) : (
-                selected.items.map((item, index) => (
-                  <div className="item" key={index}>
-                    <span>{item}</span>
-                    <button
-                      className="danger"
-                      onClick={() => deleteItem(index)}
-                    >
-                      Remove
-                    </button>
-                  </div>
-                ))
-              )}
-
-              <button
-                className="danger"
-                style={{ marginTop: 20 }}
-                onClick={() => deleteBox(selected.id)}
-              >
-                Delete Box
-              </button>
-            </div>
-
-            <div>
-              <h3>Box QR Code</h3>
-              {qrImage && (
-                <>
-                  <img src={qrImage} alt="Box QR code" className="qr" />
-                  <a
-                    href={qrImage}
-                    download={`${selected.name}-QR.png`}
+            {filteredBoxes.length === 0 ? (
+              <div className="empty">
+                No boxes found. Add your first box above.
+              </div>
+            ) : (
+              <div className="box-list">
+                {filteredBoxes.map(box => (
+                  <button
+                    key={box.id}
+                    className={`box-card ${selectedBox === box.id ? 'active' : ''}`}
+                    onClick={() => setSelectedBox(box.id)}
                   >
-                    Download QR label
-                  </a>
-                </>
-              )}
-              <p className="muted">Print this code and attach it to your box.</p>
-            </div>
-          </div>
-        </section>
+                    <strong>📦 {box.name}</strong>
+                    <span className="muted">
+                      {box.items.length} items
+                    </span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </section>
+
+          {selected && (
+            <section className="panel">
+              <div className="detail">
+                <div>
+                  <h2>{selected.name}</h2>
+                  <p className="muted">Contents of this box</p>
+
+                  <form onSubmit={addItem} className="form-row">
+                    <input
+                      value={itemName}
+                      onChange={e => setItemName(e.target.value)}
+                      placeholder="Add an item..."
+                    />
+                    <button type="submit">Add Item</button>
+                  </form>
+
+                  {selected.items.length === 0 ? (
+                    <p className="empty">This box is empty.</p>
+                  ) : (
+                    selected.items.map((item, index) => (
+                      <div className="item" key={index}>
+                        <span>{item}</span>
+                        <button
+                          className="danger"
+                          onClick={() => deleteItem(index)}
+                        >
+                          Remove
+                        </button>
+                      </div>
+                    ))
+                  )}
+
+                  <button
+                    className="danger"
+                    style={{ marginTop: 20 }}
+                    onClick={() => deleteBox(selected.id)}
+                  >
+                    Delete Box
+                  </button>
+                </div>
+
+                <div>
+                  <h3>Box QR Code</h3>
+                  {qrImage && (
+                    <>
+                      <img
+                        src={qrImage}
+                        alt="Box QR code"
+                        className="qr"
+                      />
+                      <a
+                        href={qrImage}
+                        download={`${selected.name}-QR.png`}
+                      >
+                        Download QR label
+                      </a>
+                    </>
+                  )}
+                  <p className="muted">
+                    Print this code and attach it to your box.
+                  </p>
+                </div>
+              </div>
+            </section>
+          )}
+        </>
       )}
 
       <p className="muted" style={{ textAlign: 'center', marginTop: 25 }}>
