@@ -260,6 +260,59 @@ function App() {
     ))
   }
 
+  function viewQR() {
+    if (!qrImage) return
+
+    const imageWindow = window.open('', '_blank')
+
+    if (!imageWindow) {
+      alert('Allow pop-ups for this website, then try again.')
+      return
+    }
+
+    imageWindow.document.write(`
+      <!DOCTYPE html>
+      <html>
+        <head>
+          <title>Box QR Code</title>
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <style>
+            body {
+              font-family: Arial, sans-serif;
+              text-align: center;
+              padding: 25px;
+              background: #f4f5f7;
+            }
+            img {
+              width: 280px;
+              max-width: 90%;
+              background: white;
+              padding: 15px;
+              border-radius: 12px;
+            }
+            button {
+              padding: 12px 18px;
+              margin-top: 20px;
+              border: 0;
+              border-radius: 8px;
+              background: #20242b;
+              color: white;
+              font-size: 16px;
+            }
+          </style>
+        </head>
+        <body>
+          <h2>Attic Organizer QR Label</h2>
+          <img src="${qrImage}" alt="Box QR code">
+          <br>
+          <button onclick="window.print()">Print QR Label</button>
+        </body>
+      </html>
+    `)
+
+    imageWindow.document.close()
+  }
+
   const selected = boxes.find(box => box.id === selectedBox)
 
   const filteredBoxes = boxes.filter(box =>
@@ -390,7 +443,6 @@ function App() {
             <button onClick={() => setScanning(!scanning)}>
               {scanning ? 'Cancel Scan' : '📷 Scan a QR Code'}
             </button>
-
             {scanning && <div id="reader" className="reader" />}
           </section>
 
@@ -410,9 +462,7 @@ function App() {
                     onClick={() => setSelectedBox(box.id)}
                   >
                     <strong>📦 {box.name}</strong>
-                    <span className="muted">
-                      {box.items.length} items
-                    </span>
+                    <span className="muted">{box.items.length} items</span>
                   </button>
                 ))}
               </div>
@@ -469,16 +519,17 @@ function App() {
                         alt="Box QR code"
                         className="qr"
                       />
-                      <a
-                        href={qrImage}
-                        download={`${selected.name}-QR.png`}
+                      <br />
+                      <button
+                        style={{ marginTop: 10 }}
+                        onClick={viewQR}
                       >
-                        Download QR label
-                      </a>
+                        View QR Code
+                      </button>
                     </>
                   )}
                   <p className="muted">
-                    Print this code and attach it to your box.
+                    Open, save, or print this code and attach it to your box.
                   </p>
                 </div>
               </div>
